@@ -98,7 +98,8 @@ class MultiModel(nn.Module):
         self.ukf = bool(getattr(opt, "ukf", False))
         if self.ukf:
             p = size
-            alpha_ut, beta, kappa = 1e-3, 2.0, 0.0
+            # ut_alpha must be moderate (~0.3); 1e-3 collapses the sigma-points onto the mean
+            alpha_ut, beta, kappa = float(getattr(opt, "ut_alpha", 0.3)), 2.0, 0.0
             lam = alpha_ut ** 2 * (p + kappa) - p
             self.gamma_sp = (p + lam) ** 0.5
             wm = torch.full((2 * p + 1,), 1.0 / (2 * (p + lam)))
@@ -121,7 +122,8 @@ class MultiModel(nn.Module):
         return self.encoder(x)
 
     def head(self, enc):  # [B, d] -> [B, 1]
-        enc = F.normalize(enc, p=2, dim=1)
+        if self.use_backprop:  # RegHD (delta rule) keeps the raw encoding; normalizing it hurts training
+            enc = F.normalize(enc, p=2, dim=1)
         if self.k == 1:
             return (enc * self.M[0]).sum(dim=1, keepdim=True)
         sims = enc @ F.normalize(self.clusters, p=2, dim=1).t()   # [B, k]
@@ -141,8 +143,9 @@ class MultiModel(nn.Module):
         """
         B = X.shape[0]
         p = self.size
-        var = X.var(dim=1)                                   # [B]  (R)
-        spread = self.gamma_sp * torch.sqrt(torch.clamp(var, min=0.0) + 1e-12)  # [B]
+        var = X.var(dim=1)                                   # [B]
+        noise_var = 0.5 * (X[:, 1:] - X[:, :-1]).var(dim=1)  # [B] high-frequency (noise) variance
+        spread = self.gamma_sp * torch.sqrt(torch.clamp(noise_var, min=1e-4))  # [B]
         # sigma-points: [B, 2p+1, size]
         pts = X.unsqueeze(1) + spread.view(B, 1, 1) * self.ut_offsets.unsqueeze(0)
         Phi = self.encode(pts.reshape(B * (2 * p + 1), p)).reshape(B, 2 * p + 1, -1)  # [B,2p+1,d]
@@ -161,8 +164,7 @@ class MultiModel(nn.Module):
         return self.head(self.encode(X))
 
     # ---------- manual update (RegHD delta rule) ----------
-    def manual_update(self, enc, y):  # enc: [B,d], y: [B,1]
-        enc = F.normalize(enc, p=2, dim=1)
+    def manual_update(self, enc, y):  # enc: [B,d], y: [B,1] (RegHD delta rule, no encoding normalization)
         b = enc.shape[0]
         if self.k == 1:
             pred = (enc * self.M[0]).sum(dim=1, keepdim=True)

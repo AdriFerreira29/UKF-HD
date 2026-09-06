@@ -8,7 +8,54 @@ from Stuff.DatasetLoader import DatasetLoader
 from Stuff.Initializer import Initializer
 import matplotlib.pyplot as plt
 import csv
+import time
+import logging
 import torch
+from codecarbon import OfflineEmissionsTracker
+
+logging.getLogger("codecarbon").setLevel(logging.ERROR)
+
+
+def _sync(dev):
+    if str(dev).startswith("cuda"):
+        torch.cuda.synchronize()
+
+
+def _tracked(fn, dev):
+    """Run fn() under CodeCarbon + wall clock. Returns (result, dur_s, energy_kWh, co2_kg, gpu_kWh).
+
+    cuda.synchronize() brackets the region so GPU timing/energy is accurate (kernels are async).
+    Falls back to wall-clock only if CodeCarbon fails, so a tracker error never kills a run.
+    """
+    _sync(dev)
+    t0 = time.perf_counter()
+    tr = None
+    try:
+        tr = OfflineEmissionsTracker(country_iso_code="BRA", save_to_file=False,
+                                     log_level="error", measure_power_secs=1)
+        tr.start()
+    except Exception:
+        tr = None
+    result = fn()
+    _sync(dev)
+    dur, energy, co2, gpu = time.perf_counter() - t0, "", "", ""
+    if tr is not None:
+        try:
+            tr.stop()
+            d = tr.final_emissions_data
+            dur, energy, co2, gpu = d.duration, d.energy_consumed, d.emissions, d.gpu_energy
+        except Exception:
+            pass
+    return result, dur, energy, co2, gpu
+
+
+def run_timed(model, opt, dev, sets_training, sets_testing, mN, mC, y, sets_cv):
+    """Time+measure train and test, storing metrics on the model, and return the test error."""
+    _, model.train_dur, model.train_kwh, model.train_co2, model.train_gpu = _tracked(
+        lambda: model.train(sets_training, mN, mC, y, opt.epochs, sets_cv), dev)
+    error, model.test_dur, model.test_kwh, model.test_co2, model.test_gpu = _tracked(
+        lambda: model.test(sets_testing, mN, mC, y, cv=False), dev)
+    return error
 
 def parse_option():
     parser = argparse.ArgumentParser('argument for training')
@@ -48,8 +95,21 @@ def parse_option():
     
     parser.add_argument('--model', type=str, default='KalmanHD',
                         choices=['RegHD', 'VAE', 'DNN', 'KalmanFilter', 'KalmanHD',
-                                 'GradHD', 'UKFHD', 'GradHD_UKF'],
+                                 'GradHD', 'UKFHD', 'GradHD_UKF',
+                                 'RandomForest', 'LSTM', 'BLSTM'],
                         help='Model to test')
+
+    parser.add_argument('--lstm_hidden', type=int, default=64,
+                        help='LSTM/BLSTM: hidden size')
+
+    parser.add_argument('--lstm_layers', type=int, default=1,
+                        help='LSTM/BLSTM: number of stacked layers')
+
+    parser.add_argument('--rf_estimators', type=int, default=100,
+                        help='RandomForest: number of trees')
+
+    parser.add_argument('--rf_max_depth', type=int, default=None,
+                        help='RandomForest: max tree depth (None = unlimited)')
 
     parser.add_argument('--use_backprop', action='store_true',
                         help='GradHD: usar backpropagation (Adam) ao inves de delta rule (RegHD)')
@@ -69,6 +129,20 @@ def parse_option():
 
     parser.add_argument('--ukf_mode', type=str, default='ukf', choices=['kf', 'ukf'],
                         help='UKFHD: ganho do Kalman padrao (kf, cov d×d) ou Unscented por sigma-points no input (ukf)')
+
+    # UKF-HD conditioning hyperparameters (improvements)
+    parser.add_argument('--ut_alpha', type=float, default=0.3,
+                        help='UKFHD: unscented spread scale (sigma-points); ~0.3. Old broken value was 1e-3')
+    parser.add_argument('--pyy_floor', type=float, default=0.05,
+                        help='UKFHD: floor on innovation covariance Pyy (gain guard vs divergence)')
+    parser.add_argument('--meas_scale', type=float, default=1.0,
+                        help='UKFHD: measurement-noise sensitivity to the estimated noise variance')
+    parser.add_argument('--var_floor', type=float, default=1e-4,
+                        help='UKFHD: floor on the variance driving the sigma-point spread')
+    parser.add_argument('--a_clip', type=float, default=1.0,
+                        help='UKFHD: innovation clip (anti-divergence)')
+    parser.add_argument('--q_proc', type=float, default=0.0,
+                        help='UKFHD: KF-mode process noise Q (0 = faithful linear KF; >0 keeps P from collapsing)')
     
     parser.add_argument('--size_of_sample', type=int, default=20, 
                         help='Number of previous samples before forecasting')
@@ -167,23 +241,20 @@ def main():
         from models.RegHD.RegHD import Return_Model
         model = Return_Model(opt.size_of_sample, opt.dimension_hd, opt.models, matrix_1_norm.shape[0], opt, dev)
         y = np.zeros((matrix_1_norm.shape))
-        model.train(sets_training, matrix_1_norm, matrix_1_norm_org, y, opt.epochs, sets_cv)
-        error = model.test(sets_testing, matrix_1_norm, matrix_1_norm_org, y, cv=False)
+        error = run_timed(model, opt, dev, sets_training, sets_testing, matrix_1_norm, matrix_1_norm_org, y, sets_cv)
 
     if opt.model == "KalmanFilter":
         from models.KalmanFilter.AR import Return_Model
         model = Return_Model(opt.size_of_sample, opt.dimension_hd, opt.models, matrix_1_norm.shape[0], opt)
         y = np.zeros((matrix_1_norm.shape))
-        model.train(sets_training, matrix_1_norm, matrix_1_norm_org, y, opt.epochs, sets_cv)
-        error = model.test(sets_testing, matrix_1_norm, matrix_1_norm_org, y, cv=False)
+        error = run_timed(model, opt, dev, sets_training, sets_testing, matrix_1_norm, matrix_1_norm_org, y, sets_cv)
 
     if opt.model == "KalmanHD":
         #from models.ARHD.RegHD_AR_M import Return_Model
         from models.KalmanHD.KalmanHD_binary import Return_Model
         model = Return_Model(opt.size_of_sample, opt.dimension_hd, opt.models, matrix_1_norm.shape[0], opt, dev)
         y = np.zeros((matrix_1_norm.shape))
-        model.train(sets_training, matrix_1_norm, matrix_1_norm_org, y, opt.epochs, sets_cv)
-        error = model.test(sets_testing, matrix_1_norm, matrix_1_norm_org, y, cv=False)
+        error = run_timed(model, opt, dev, sets_training, sets_testing, matrix_1_norm, matrix_1_norm_org, y, sets_cv)
 
     if opt.model in ("GradHD", "GradHD_UKF"):
         if opt.model == "GradHD_UKF":
@@ -191,15 +262,25 @@ def main():
         from models.GradHD.GradHD import Return_Model
         model = Return_Model(opt.size_of_sample, opt.dimension_hd, opt.models, matrix_1_norm.shape[0], opt, dev)
         y = np.zeros((matrix_1_norm.shape))
-        model.train(sets_training, matrix_1_norm, matrix_1_norm_org, y, opt.epochs, sets_cv)
-        error = model.test(sets_testing, matrix_1_norm, matrix_1_norm_org, y, cv=False)
+        error = run_timed(model, opt, dev, sets_training, sets_testing, matrix_1_norm, matrix_1_norm_org, y, sets_cv)
 
     if opt.model == "UKFHD":
         from models.UKFHD.UKFHD import Return_Model
         model = Return_Model(opt.size_of_sample, opt.dimension_hd, opt.models, matrix_1_norm.shape[0], opt, dev)
         y = np.zeros((matrix_1_norm.shape))
-        model.train(sets_training, matrix_1_norm, matrix_1_norm_org, y, opt.epochs, sets_cv)
-        error = model.test(sets_testing, matrix_1_norm, matrix_1_norm_org, y, cv=False)
+        error = run_timed(model, opt, dev, sets_training, sets_testing, matrix_1_norm, matrix_1_norm_org, y, sets_cv)
+
+    if opt.model == "RandomForest":
+        from models.RandomForest.RandomForest import Return_Model
+        model = Return_Model(opt.size_of_sample, opt.dimension_hd, opt.models, matrix_1_norm.shape[0], opt, dev)
+        y = np.zeros((matrix_1_norm.shape))
+        error = run_timed(model, opt, dev, sets_training, sets_testing, matrix_1_norm, matrix_1_norm_org, y, sets_cv)
+
+    if opt.model in ("LSTM", "BLSTM"):
+        from models.LSTM.LSTM import Return_Model
+        model = Return_Model(opt.size_of_sample, opt.dimension_hd, opt.models, matrix_1_norm.shape[0], opt, dev)
+        y = np.zeros((matrix_1_norm.shape))
+        error = run_timed(model, opt, dev, sets_training, sets_testing, matrix_1_norm, matrix_1_norm_org, y, sets_cv)
 
     if opt.model == "DNN":
         from models.DNN.DNN import Return_Model, Train_Model, Test_Model
@@ -259,12 +340,14 @@ def add_value_to_csv(csv_file, ts, model, models, novelty, lr, hd_bites, noise, 
         writer = csv.writer(file)
         writer.writerows(data)
 
-def log_result_full(opt, error, model, filename='results_paper.csv'):
-    """Loga MAE (=error nos nossos modelos) + RMSE + toda a config, em formato apendado."""
+def log_result_full(opt, error, model, filename='results_extended.csv'):
+    """Loga MAE + RMSE + config + device/tempo/energia/CO2 (CodeCarbon), em formato apendado."""
     rmse = getattr(model, 'last_rmse', '')
     fieldnames = ['Dataset', 'Model', 'encoder', 'online', 'use_backprop', 'ukf', 'ukf_mode',
                   'models', 'size', 'dim', 'lr', 'levels', 'epochs',
-                  'Gaussian', 'Poisson', 'MissingP', 'trial', 'MAE', 'RMSE']
+                  'Gaussian', 'Poisson', 'MissingP', 'trial', 'device', 'MAE', 'RMSE',
+                  'TrainDur_s', 'TrainEnergy_kWh', 'TrainGPU_kWh', 'TrainCO2_kg',
+                  'TestDur_s', 'TestEnergy_kWh']
     row = {
         'Dataset': opt.dataset, 'Model': opt.model,
         'encoder': getattr(opt, 'encoder', ''), 'online': getattr(opt, 'online', ''),
@@ -273,7 +356,10 @@ def log_result_full(opt, error, model, filename='results_paper.csv'):
         'size': opt.size_of_sample, 'dim': opt.dimension_hd, 'lr': opt.learning_rate,
         'levels': getattr(opt, 'levels', ''), 'epochs': opt.epochs,
         'Gaussian': opt.gaussian_noise, 'Poisson': opt.poisson_noise, 'MissingP': opt.p,
-        'trial': opt.trial, 'MAE': error, 'RMSE': rmse,
+        'trial': opt.trial, 'device': getattr(opt, 'device', ''), 'MAE': error, 'RMSE': rmse,
+        'TrainDur_s': getattr(model, 'train_dur', ''), 'TrainEnergy_kWh': getattr(model, 'train_kwh', ''),
+        'TrainGPU_kWh': getattr(model, 'train_gpu', ''), 'TrainCO2_kg': getattr(model, 'train_co2', ''),
+        'TestDur_s': getattr(model, 'test_dur', ''), 'TestEnergy_kWh': getattr(model, 'test_kwh', ''),
     }
     file_exists = os.path.isfile(filename)
     with open(filename, 'a', newline='') as f:

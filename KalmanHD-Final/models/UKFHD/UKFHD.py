@@ -24,14 +24,25 @@ class UKF_HD(nn.Module):
 
         # state, updated manually without autograd
         self.alpha = torch.zeros(d, device=self.dev)
-        self.var = torch.zeros((), device=self.dev)
+        self.var = torch.zeros((), device=self.dev)        # MA of window variance (signal+noise)
+        self.noise_var = torch.zeros((), device=self.dev)  # MA of high-frequency (noise) variance
+
+        # conditioning hyperparameters (see the UKF-HD improvement plan)
+        self.var_floor = float(getattr(opt, "var_floor", 1e-4))    # floor on variance used for the spread
+        self.pyy_floor = float(getattr(opt, "pyy_floor", 0.05))    # floor on innovation covariance (gain guard)
+        self.meas_scale = float(getattr(opt, "meas_scale", 1.0))   # measurement-noise sensitivity to noise_var
+        self.meas_r0 = float(getattr(opt, "meas_r0", 0.0))         # additive measurement-noise floor
+        self.a_clip = float(getattr(opt, "a_clip", 1.0))           # innovation clip (anti-divergence)
+        self.q_proc = float(getattr(opt, "q_proc", 0.0))           # KF process noise (0 = faithful linear KF)
 
         # d x d covariance, only needed in KF mode
         self.P = 0.1 * torch.eye(d, device=self.dev) if ukf_mode == "kf" else None
 
-        # Unscented Transform weights (standard parameters)
+        # Unscented Transform weights (scaled UT; ut_alpha sets the sigma-point spread).
+        # Note: ut_alpha must be moderate (~0.3); ut_alpha=1e-3 collapses the sigma-points onto the mean.
         p = size
-        alpha_ut, beta, kappa = 1e-3, 2.0, 0.0
+        alpha_ut = float(getattr(opt, "ut_alpha", 0.3))
+        beta, kappa = 2.0, 0.0
         lam = alpha_ut ** 2 * (p + kappa) - p
         self.p = p
         self.lam = lam
@@ -48,8 +59,8 @@ class UKF_HD(nn.Module):
         return F.normalize(self.encoder(x), p=2, dim=1)
 
     # ---------- sigma-points on the input ----------
-    def _sigma_points(self, x):  # x: [size] -> [2p+1, size]; Px = var * I_p (isotropic diagonal)
-        spread = self.gamma_sp * torch.sqrt(torch.clamp(self.var, min=0.0) + 1e-12)
+    def _sigma_points(self, x):  # x: [size] -> [2p+1, size]; Px = noise_var * I_p (isotropic diagonal)
+        spread = self.gamma_sp * torch.sqrt(torch.clamp(self.noise_var, min=self.var_floor))
         pts = x.unsqueeze(0).repeat(2 * self.p + 1, 1)
         eye = torch.eye(self.p, device=self.dev) * spread
         pts[1:self.p + 1] += eye
@@ -58,29 +69,34 @@ class UKF_HD(nn.Module):
 
     # ---------- per sample update ----------
     def update(self, x, y):
-        # moving average of the data variance (R)
+        # moving averages: window variance (signal+noise) and NOISE variance (via lag-1 differences)
         self.var = self.gamma * self.var + (1 - self.gamma) * torch.var(x)
-        R = self.var * self.d
+        nv = 0.5 * torch.var(x[1:] - x[:-1]) if x.numel() > 1 else torch.var(x)
+        self.noise_var = self.gamma * self.noise_var + (1 - self.gamma) * nv
+        # measurement noise from the estimated noise level (not Var(x)*D, which underfit and diverged)
+        R = self.meas_scale * self.noise_var + self.meas_r0
 
         if self.mode == "ukf":
             X = self._sigma_points(x)                 # [2p+1, size]
             Phi = self.encode(X)                      # [2p+1, d]
             Y = Phi @ self.alpha                      # [2p+1]
             yhat = (self.wm * Y).sum()
-            Pyy = (self.wc * (Y - yhat) ** 2).sum() + R + 1e-9
+            Pyy = (self.wc * (Y - yhat) ** 2).sum() + R
+            Pyy = torch.clamp(Pyy, min=self.pyy_floor)     # gain guard: Pyy cannot collapse to ~0
             Phibar = (self.wm.unsqueeze(1) * Phi).sum(0)   # [d] denoised unscented encoding
-            A = y - yhat
+            A = torch.clamp(y - yhat, -self.a_clip, self.a_clip)  # innovation guard
             G = Phibar / Pyy                          # unscented gain
             self.alpha += self.lr * G * A
         else:  # standard KF with a d x d covariance
             enc = self.encode(x.unsqueeze(0)).squeeze(0)   # [d]
             yhat = enc @ self.alpha
             Pphi = self.P @ enc                       # [d]
-            S = enc @ Pphi + R + 1e-9
-            A = y - yhat
+            S = torch.clamp(enc @ Pphi + R, min=self.pyy_floor)
+            A = torch.clamp(y - yhat, -self.a_clip, self.a_clip)
             G = Pphi / S                              # Kalman gain
             self.alpha += self.lr * G * A
             self.P -= torch.outer(G, Pphi)
+            self.P.diagonal().add_(self.q_proc)       # process noise Q: keeps P from collapsing
 
     # ---------- prediction ----------
     def predict_batch(self, X):  # [B, size] -> [B]
